@@ -1,7 +1,7 @@
 import os
 import base64
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from uuid import UUID
 from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Depends
 from pydantic import BaseModel
@@ -18,6 +18,58 @@ from .prompts import (
     HTML_EDIT_SYSTEM_PROMPT,
 )
 from models.sql.template import TemplateModel
+from enums.llm_provider import LLMProvider
+from utils.llm_provider import get_llm_provider, get_model
+from utils.get_env import (
+    get_openai_api_key_env,
+    get_custom_llm_url_env,
+    get_custom_llm_api_key_env,
+    get_custom_model_env,
+)
+
+
+def _get_template_llm_client() -> Tuple[OpenAI, str, bool]:
+    """Return (client, model, use_responses_api) based on the configured LLM provider."""
+    provider = get_llm_provider()
+    if provider == LLMProvider.OPENAI:
+        api_key = get_openai_api_key_env()
+        if not api_key:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY environment variable not set")
+        return OpenAI(api_key=api_key), get_model(), True
+    elif provider == LLMProvider.CUSTOM:
+        url = get_custom_llm_url_env()
+        if not url:
+            raise HTTPException(status_code=500, detail="CUSTOM_LLM_URL is not set. Configure it in Settings.")
+        model = get_custom_model_env()
+        if not model:
+            raise HTTPException(status_code=500, detail="CUSTOM_MODEL is not set. Configure it in Settings.")
+        return OpenAI(base_url=url, api_key=get_custom_llm_api_key_env() or "null", timeout=120.0), model, False
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Template creation requires OpenAI or Custom LLM provider. Please change your provider in Settings.",
+        )
+
+
+def _convert_to_chat_messages(input_payload: list) -> list:
+    """Convert Responses API input format to Chat Completions messages format."""
+    messages = []
+    for msg in input_payload:
+        role = msg["role"]
+        content = msg["content"]
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if part.get("type") == "input_image":
+                    parts.append({"type": "image_url", "image_url": {"url": part["image_url"]}})
+                elif part.get("type") == "input_text":
+                    parts.append({"type": "text", "text": part["text"]})
+                else:
+                    parts.append(part)
+            messages.append({"role": role, "content": parts})
+    return messages
 
 
 # Create separate routers for each functionality
@@ -131,32 +183,16 @@ async def generate_html_from_slide(
     base64_image: str,
     media_type: str,
     xml_content: str,
-    api_key: str,
+    client: OpenAI,
+    model: str,
+    use_responses_api: bool,
     fonts: Optional[List[str]] = None,
 ) -> str:
     """
-    Generate HTML content from slide image and XML using OpenAI GPT-5 Responses API.
-
-    Args:
-        base64_image: Base64 encoded image data
-        media_type: MIME type of the image (e.g., 'image/png')
-        xml_content: OXML content as text
-        api_key: OpenAI API key
-        fonts: Optional list of normalized root font families to prefer in output
-
-    Returns:
-        Generated HTML content as string
-
-    Raises:
-        HTTPException: If API call fails or no content is generated
+    Generate HTML content from slide image and XML using the configured LLM provider.
     """
-    print(
-        f"Generating HTML from slide image and XML using OpenAI GPT-5 Responses API..."
-    )
+    print(f"Generating HTML from slide image and XML (model={model}, responses_api={use_responses_api})...")
     try:
-        client = OpenAI(api_key=api_key)
-
-        # Compose input for Responses API. Include system prompt, image (separate), OXML and optional fonts text.
         data_url = f"data:{media_type};base64,{base64_image}"
         fonts_text = (
             f"\nFONTS (Normalized root families used in this slide, use where it is required): {', '.join(fonts)}"
@@ -175,82 +211,80 @@ async def generate_html_from_slide(
             },
         ]
 
-        print("Making Responses API request for HTML generation...")
-        response = client.responses.create(
-            model="gpt-5",
-            input=input_payload,
-            reasoning={"effort": "high"},
-            text={"verbosity": "low"},
-        )
-
-        # Extract the response text
-        html_content = (
-            getattr(response, "output_text", None)
-            or getattr(response, "text", None)
-            or ""
-        )
+        if use_responses_api:
+            print("Making Responses API request for HTML generation...")
+            response = client.responses.create(
+                model=model,
+                input=input_payload,
+                reasoning={"effort": "high"},
+                text={"verbosity": "low"},
+            )
+            html_content = (
+                getattr(response, "output_text", None)
+                or getattr(response, "text", None)
+                or ""
+            )
+        else:
+            print("Making Chat Completions API request for HTML generation...")
+            messages = _convert_to_chat_messages(input_payload)
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=16384,
+            )
+            html_content = response.choices[0].message.content or ""
 
         print(f"Received HTML content length: {len(html_content)}")
 
         if not html_content:
             raise HTTPException(
-                status_code=500, detail="No HTML content generated by OpenAI GPT-5"
+                status_code=500, detail="No HTML content generated by LLM"
             )
 
         return html_content
 
     except APIError as e:
-        print(f"OpenAI API Error: {e}")
+        print(f"LLM API Error: {e}")
         raise HTTPException(
-            status_code=500, detail=f"OpenAI API error during HTML generation: {str(e)}"
+            status_code=500, detail=f"LLM API error during HTML generation: {str(e)}"
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        # Handle various API errors
         error_msg = str(e)
         print(f"Exception occurred: {error_msg}")
         print(f"Exception type: {type(e)}")
         if "timeout" in error_msg.lower():
             raise HTTPException(
                 status_code=408,
-                detail=f"OpenAI API timeout during HTML generation: {error_msg}",
+                detail=f"LLM API timeout during HTML generation: {error_msg}",
             )
         elif "connection" in error_msg.lower():
             raise HTTPException(
                 status_code=503,
-                detail=f"OpenAI API connection error during HTML generation: {error_msg}",
+                detail=f"LLM API connection error during HTML generation: {error_msg}",
             )
         else:
             raise HTTPException(
                 status_code=500,
-                detail=f"OpenAI API error during HTML generation: {error_msg}",
+                detail=f"LLM API error during HTML generation: {error_msg}",
             )
 
 
 async def generate_react_component_from_html(
     html_content: str,
-    api_key: str,
+    client: OpenAI,
+    model: str,
+    use_responses_api: bool,
     image_base64: Optional[str] = None,
     media_type: Optional[str] = None,
 ) -> str:
     """
-    Convert HTML content to TSX React component using OpenAI GPT-5 Responses API.
-
-    Args:
-        html_content: Generated HTML content
-        api_key: OpenAI API key
-
-    Returns:
-        Generated TSX React component code as string
-
-    Raises:
-        HTTPException: If API call fails or no content is generated
+    Convert HTML content to TSX React component using the configured LLM provider.
     """
     try:
-        client = OpenAI(api_key=api_key)
+        print("Making LLM request for React component generation...")
 
-        print("Making Responses API request for React component generation...")
-
-        # Build payload with optional image
         content_parts = [{"type": "input_text", "text": f"HTML INPUT:\n{html_content}"}]
         if image_base64 and media_type:
             data_url = f"data:{media_type};base64,{image_base64}"
@@ -261,24 +295,32 @@ async def generate_react_component_from_html(
             {"role": "user", "content": content_parts},
         ]
 
-        response = client.responses.create(
-            model="gpt-5",
-            input=input_payload,
-            reasoning={"effort": "minimal"},
-            text={"verbosity": "low"},
-        )
-
-        react_content = (
-            getattr(response, "output_text", None)
-            or getattr(response, "text", None)
-            or ""
-        )
+        if use_responses_api:
+            response = client.responses.create(
+                model=model,
+                input=input_payload,
+                reasoning={"effort": "minimal"},
+                text={"verbosity": "low"},
+            )
+            react_content = (
+                getattr(response, "output_text", None)
+                or getattr(response, "text", None)
+                or ""
+            )
+        else:
+            messages = _convert_to_chat_messages(input_payload)
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=16384,
+            )
+            react_content = response.choices[0].message.content or ""
 
         print(f"Received React content length: {len(react_content)}")
 
         if not react_content:
             raise HTTPException(
-                status_code=500, detail="No React component generated by OpenAI GPT-5"
+                status_code=500, detail="No React component generated by LLM"
             )
 
         react_content = (
@@ -288,7 +330,6 @@ async def generate_react_component_from_html(
             .replace("javascript", "")
         )
 
-        # Filter out lines that start with import or export
         filtered_lines = []
         for line in react_content.split("\n"):
             stripped_line = line.strip()
@@ -303,30 +344,31 @@ async def generate_react_component_from_html(
 
         return filtered_react_content
     except APIError as e:
-        print(f"OpenAI API Error: {e}")
+        print(f"LLM API Error: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"OpenAI API error during React generation: {str(e)}",
+            detail=f"LLM API error during React generation: {str(e)}",
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        # Handle various API errors
         error_msg = str(e)
         print(f"Exception occurred: {error_msg}")
         print(f"Exception type: {type(e)}")
         if "timeout" in error_msg.lower():
             raise HTTPException(
                 status_code=408,
-                detail=f"OpenAI API timeout during React generation: {error_msg}",
+                detail=f"LLM API timeout during React generation: {error_msg}",
             )
         elif "connection" in error_msg.lower():
             raise HTTPException(
                 status_code=503,
-                detail=f"OpenAI API connection error during React generation: {error_msg}",
+                detail=f"LLM API connection error during React generation: {error_msg}",
             )
         else:
             raise HTTPException(
                 status_code=500,
-                detail=f"OpenAI API error during React generation: {error_msg}",
+                detail=f"LLM API error during React generation: {error_msg}",
             )
 
 
@@ -336,29 +378,15 @@ async def edit_html_with_images(
     media_type: str,
     html_content: str,
     prompt: str,
-    api_key: str,
+    client: OpenAI,
+    model: str,
+    use_responses_api: bool,
 ) -> str:
     """
-    Edit HTML content based on one or two images and a text prompt using OpenAI GPT-5 Responses API.
-
-    Args:
-        current_ui_base64: Base64 encoded current UI image data
-        sketch_base64: Base64 encoded sketch/indication image data (optional)
-        media_type: MIME type of the images (e.g., 'image/png')
-        html_content: Current HTML content to edit
-        prompt: Text prompt describing the changes
-        api_key: OpenAI API key
-
-    Returns:
-        Edited HTML content as string
-
-    Raises:
-        HTTPException: If API call fails or no content is generated
+    Edit HTML content based on one or two images and a text prompt using the configured LLM provider.
     """
     try:
-        client = OpenAI(api_key=api_key)
-
-        print("Making Responses API request for HTML editing...")
+        print("Making LLM request for HTML editing...")
 
         current_data_url = f"data:{media_type};base64,{current_ui_base64}"
         sketch_data_url = (
@@ -373,7 +401,6 @@ async def edit_html_with_images(
             },
         ]
         if sketch_data_url:
-            # Insert sketch image after current UI image for context
             content_parts.insert(
                 1, {"type": "input_image", "image_url": sketch_data_url}
             )
@@ -383,53 +410,62 @@ async def edit_html_with_images(
             {"role": "user", "content": content_parts},
         ]
 
-        response = client.responses.create(
-            model="gpt-5",
-            input=input_payload,
-            reasoning={"effort": "low"},
-            text={"verbosity": "low"},
-        )
-
-        edited_html = (
-            getattr(response, "output_text", None)
-            or getattr(response, "text", None)
-            or ""
-        )
+        if use_responses_api:
+            response = client.responses.create(
+                model=model,
+                input=input_payload,
+                reasoning={"effort": "low"},
+                text={"verbosity": "low"},
+            )
+            edited_html = (
+                getattr(response, "output_text", None)
+                or getattr(response, "text", None)
+                or ""
+            )
+        else:
+            messages = _convert_to_chat_messages(input_payload)
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=16384,
+            )
+            edited_html = response.choices[0].message.content or ""
 
         print(f"Received edited HTML content length: {len(edited_html)}")
 
         if not edited_html:
             raise HTTPException(
                 status_code=500,
-                detail="No edited HTML content generated by OpenAI GPT-5",
+                detail="No edited HTML content generated by LLM",
             )
 
         return edited_html
 
     except APIError as e:
-        print(f"OpenAI API Error: {e}")
+        print(f"LLM API Error: {e}")
         raise HTTPException(
-            status_code=500, detail=f"OpenAI API error during HTML editing: {str(e)}"
+            status_code=500, detail=f"LLM API error during HTML editing: {str(e)}"
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        # Handle various API errors
         error_msg = str(e)
         print(f"Exception occurred: {error_msg}")
         print(f"Exception type: {type(e)}")
         if "timeout" in error_msg.lower():
             raise HTTPException(
                 status_code=408,
-                detail=f"OpenAI API timeout during HTML editing: {error_msg}",
+                detail=f"LLM API timeout during HTML editing: {error_msg}",
             )
         elif "connection" in error_msg.lower():
             raise HTTPException(
                 status_code=503,
-                detail=f"OpenAI API connection error during HTML editing: {error_msg}",
+                detail=f"LLM API connection error during HTML editing: {error_msg}",
             )
         else:
             raise HTTPException(
                 status_code=500,
-                detail=f"OpenAI API error during HTML editing: {error_msg}",
+                detail=f"LLM API error during HTML editing: {error_msg}",
             )
 
 
@@ -446,12 +482,7 @@ async def convert_slide_to_html(request: SlideToHtmlRequest):
         SlideToHtmlResponse with generated HTML
     """
     try:
-        # Get OpenAI API key from environment
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise HTTPException(
-                status_code=500, detail="OPENAI_API_KEY environment variable not set"
-            )
+        client, model, use_responses_api = _get_template_llm_client()
 
         # Resolve image path to actual file system path
         actual_image_path = resolve_image_path_to_filesystem(request.image)
@@ -481,7 +512,9 @@ async def convert_slide_to_html(request: SlideToHtmlRequest):
             base64_image=base64_image,
             media_type=media_type,
             xml_content=request.xml,
-            api_key=api_key,
+            client=client,
+            model=model,
+            use_responses_api=use_responses_api,
             fonts=request.fonts,
         )
 
@@ -490,10 +523,8 @@ async def convert_slide_to_html(request: SlideToHtmlRequest):
         return SlideToHtmlResponse(success=True, html=html_content)
 
     except HTTPException:
-        # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
-        # Log the full error for debugging
         print(f"Unexpected error during slide to HTML processing: {str(e)}")
         raise HTTPException(
             status_code=500, detail=f"Error processing slide to HTML: {str(e)}"
@@ -513,12 +544,7 @@ async def convert_html_to_react(request: HtmlToReactRequest):
         HtmlToReactResponse with generated React component
     """
     try:
-        # Get OpenAI API key from environment
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise HTTPException(
-                status_code=500, detail="OPENAI_API_KEY environment variable not set"
-            )
+        client, model, use_responses_api = _get_template_llm_client()
 
         # Validate HTML content
         if not request.html or not request.html.strip():
@@ -544,7 +570,9 @@ async def convert_html_to_react(request: HtmlToReactRequest):
         # Convert HTML to React component
         react_component = await generate_react_component_from_html(
             html_content=request.html,
-            api_key=api_key,
+            client=client,
+            model=model,
+            use_responses_api=use_responses_api,
             image_base64=image_b64,
             media_type=media_type,
         )
@@ -558,10 +586,8 @@ async def convert_html_to_react(request: HtmlToReactRequest):
         )
 
     except HTTPException:
-        # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
-        # Log the full error for debugging
         print(f"Unexpected error during HTML to React processing: {str(e)}")
         raise HTTPException(
             status_code=500, detail=f"Error processing HTML to React: {str(e)}"
@@ -591,12 +617,7 @@ async def edit_html_with_images_endpoint(
         HtmlEditResponse with edited HTML
     """
     try:
-        # Get OpenAI API key from environment
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise HTTPException(
-                status_code=500, detail="OPENAI_API_KEY environment variable not set"
-            )
+        client, model, use_responses_api = _get_template_llm_client()
 
         # Validate inputs
         if not html or not html.strip():
@@ -641,7 +662,9 @@ async def edit_html_with_images_endpoint(
             media_type=media_type,
             html_content=html,
             prompt=prompt,
-            api_key=api_key,
+            client=client,
+            model=model,
+            use_responses_api=use_responses_api,
         )
 
         edited_html = edited_html.replace("```html", "").replace("```", "")
@@ -651,10 +674,8 @@ async def edit_html_with_images_endpoint(
         )
 
     except HTTPException:
-        # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
-        # Log the full error for debugging
         print(f"Unexpected error during HTML editing: {str(e)}")
         raise HTTPException(
             status_code=500, detail=f"Error processing HTML editing: {str(e)}"
